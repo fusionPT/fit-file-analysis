@@ -1525,8 +1525,9 @@ class FITFileAnalysis
                 case DATA_MESSAGE:
                     // Check that we have information on the Data Message.
                     $global_mesg_num = $this->defn_mesgs[$local_mesg_type]['global_mesg_num'];
-                    $mesg_name = $this->data_mesg_info[$global_mesg_num]['mesg_name'];
+
                     if (isset($this->data_mesg_info[$global_mesg_num])) {
+                        $mesg_name = $this->data_mesg_info[$global_mesg_num]['mesg_name'];
                         $tmp_record_array = [];  // Temporary array to store Record data message pieces
                         $tmp_value = null;  // Placeholder for value for checking before inserting into the tmp_record_array
 
