@@ -1335,7 +1335,12 @@ class FITFileAnalysis
              * Header . Data Records . CRC
              */
             //$this->file_contents = file_get_contents($file_path_or_data);  // Read the entire file into a string
-            $this->file_handler = fopen($file_path_or_data, 'rb');
+            $context = stream_context_create([
+                'http' => [
+                    'protocol_version' => '1.0',
+                ],
+            ]);
+            $this->file_handler = fopen($file_path_or_data, 'rb',false, $context);
             $file_handler = $this->file_handler;
             register_shutdown_function(function () use ($file_handler) {
                 fclose($file_handler);
@@ -1364,6 +1369,7 @@ class FITFileAnalysis
         // Handle options.
         $this->fixData($this->options);
         $this->setUnits($this->options);
+        fclose($file_handler)
     }
 
     /**
