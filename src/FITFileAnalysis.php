@@ -1369,7 +1369,7 @@ class FITFileAnalysis
         // Handle options.
         $this->fixData($this->options);
         $this->setUnits($this->options);
-        fclose($file_handler)
+        fclose($file_handler);
     }
 
     /**
