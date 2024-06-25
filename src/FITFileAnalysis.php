@@ -1320,6 +1320,9 @@ class FITFileAnalysis
     // PHP Constructor - called when an object of the class is instantiated.
     public function __construct($file_path_or_data, $options = null)
     {
+        stream_context_set_default(['http' => [
+            'protocol_version' => '1.0',
+        ]]);
         if (isset($options['input_is_data'])) {
             $this->file_contents = $file_path_or_data;
         } else {
@@ -1569,7 +1572,7 @@ class FITFileAnalysis
                                         $tmp_record_array[$field_defns['field_name']] = $tmp_value;
                                     } else {
                                         if ($base_type === 7) {  // Handle strings appropriately
-                                            $this->data_mesgs[$mesg_name][$field_defns['field_name']][] = filter_var($tmp_value, FILTER_SANITIZE_STRING);
+                                            $this->data_mesgs[$mesg_name][$field_defns['field_name']][] = filter_var($tmp_value, FILTER_SANITIZE_FULL_SPECIAL_CHARS);
                                         } else {
                                             // Handle arrays
                                             if ($size !== $bytes) {
