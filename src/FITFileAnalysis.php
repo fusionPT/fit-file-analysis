@@ -1346,7 +1346,7 @@ class FITFileAnalysis
             $this->file_handler = fopen($file_path_or_data, 'rb',false, $context);
             $file_handler = $this->file_handler;
             register_shutdown_function(function () use ($file_handler) {
-                $file_handler && fclose($file_handler);
+                is_resource($file_handler) && fclose($file_handler);
             });
 
         }
