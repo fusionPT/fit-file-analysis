@@ -1855,15 +1855,15 @@ class FITFileAnalysis
 
         $bCadence = $bDistance = $bHeartRate = $bLatitudeLongitude = $bSpeed = $bPower = $bAltitude = $bEnhancedSpeed = $bEnhancedAltitude = false;
         if (in_array('all', $options['fix_data'])) {
-            $bCadence = isset($this->data_mesgs['record']['cadence']);
-            $bDistance = isset($this->data_mesgs['record']['distance']);
-            $bHeartRate = isset($this->data_mesgs['record']['heart_rate']);
-            $bLatitudeLongitude = isset($this->data_mesgs['record']['position_lat']) && isset($this->data_mesgs['record']['position_long']);
-            $bSpeed = isset($this->data_mesgs['record']['speed']);
-            $bPower = isset($this->data_mesgs['record']['power']);
-            $bAltitude = isset($this->data_mesgs['record']['altitude']);
-            $bEnhancedSpeed = isset($this->data_mesgs['record']['enhanced_speed']);
-            $bEnhancedAltitude = isset($this->data_mesgs['record']['enhanced_altitude']);
+            $bCadence = isset($this->data_mesgs['record']['cadence']) && is_array($this->data_mesgs['record']['cadence']);
+            $bDistance = isset($this->data_mesgs['record']['distance']) && is_array($this->data_mesgs['record']['distance']);
+            $bHeartRate = isset($this->data_mesgs['record']['heart_rate']) && is_array($this->data_mesgs['record']['heart_rate']);
+            $bLatitudeLongitude = isset($this->data_mesgs['record']['position_lat']) && is_array($this->data_mesgs['record']['position_lat']) && isset($this->data_mesgs['record']['position_long']) && is_array($this->data_mesgs['record']['position_long']);
+            $bSpeed = isset($this->data_mesgs['record']['speed']) && is_array($this->data_mesgs['record']['speed']);
+            $bPower = isset($this->data_mesgs['record']['power']) && is_array($this->data_mesgs['record']['power']);
+            $bAltitude = isset($this->data_mesgs['record']['altitude']) && is_array($this->data_mesgs['record']['altitude']);
+            $bEnhancedSpeed = isset($this->data_mesgs['record']['enhanced_speed']) && is_array($this->data_mesgs['record']['enhanced_speed']);
+            $bEnhancedAltitude = isset($this->data_mesgs['record']['enhanced_altitude']) && is_array($this->data_mesgs['record']['enhanced_altitude']);
         } else {
             if (isset($this->data_mesgs['record']['timestamp'])) {
                 $count_timestamp = count($this->data_mesgs['record']['timestamp']);  // No point try to insert missing values if we know there aren't any.
