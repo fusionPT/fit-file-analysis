@@ -2021,6 +2021,11 @@ class FITFileAnalysis
                     $prev_value = current($array);
                     $next_value = next($array);
                 }
+
+                // Guard against non-numeric values (some FIT files store arrays instead of scalars)
+                if (!is_numeric($prev_value)) $prev_value = 0;
+                if (!is_numeric($next_value)) $next_value = 0;
+
                 for ($j = $i + 1; $j < $count; ++$j) {
                     if ($missing_keys[$j] < key($array)) {
                         $num_points++;
