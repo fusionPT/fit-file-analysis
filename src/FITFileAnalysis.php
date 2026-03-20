@@ -1574,14 +1574,15 @@ class FITFileAnalysis
                                         if ($base_type === 7) {  // Handle strings appropriately
                                             $this->data_mesgs[$mesg_name][$field_defns['field_name']][] = filter_var($tmp_value, FILTER_SANITIZE_FULL_SPECIAL_CHARS);
                                         } else {
-                                            // Handle arrays
+                                            // Handle arrays — store first value only to keep record fields as scalars
                                             if ($size !== $bytes) {
-                                                $tmp_array = [];
                                                 $num_vals = $size / $bytes;
+                                                $first_val = null;
                                                 for ($i = 0; $i < $num_vals; ++$i) {
-                                                    $tmp_array[] = unpack($format, $raw_binary_data)['tmp'] / $field_defns['scale'] - $field_defns['offset'];
+                                                    $v = unpack($format, $raw_binary_data)['tmp'] / $field_defns['scale'] - $field_defns['offset'];
+                                                    if ($first_val === null) $first_val = $v;
                                                 }
-                                                $this->data_mesgs[$mesg_name][$field_defns['field_name']][] = $tmp_array;
+                                                $this->data_mesgs[$mesg_name][$field_defns['field_name']][] = $first_val;
                                             } else {
                                                 $this->data_mesgs[$mesg_name][$field_defns['field_name']][] = $tmp_value / $field_defns['scale'] - $field_defns['offset'];
                                             }
