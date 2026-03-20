@@ -3078,11 +3078,16 @@ class FITFileAnalysis
         if (is_array($last_event_timestamp)) {
             $last_event_timestamp = $last_event_timestamp[0];
         }
-        $start_timestamp = $this->data_mesgs['hr']['timestamp'] - $last_event_timestamp / 1024.0;
+        $hr_timestamp = $this->data_mesgs['hr']['timestamp'];
+        if (is_array($hr_timestamp)) {
+            $hr_timestamp = end($hr_timestamp);
+        }
+        $start_timestamp = $hr_timestamp - $last_event_timestamp / 1024.0;
         $timestamps[] = $last_event_timestamp / 1024.0;
 
         // Determine timestamps (similar to compressed timestamps)
         foreach ($this->data_mesgs['hr']['event_timestamp_12'] as $event_timestamp_12_val) {
+            if (!is_array($event_timestamp_12_val)) continue;
             $j = 0;
             for ($i = 0; $i < 11; $i++) {
                 $last_event_timestamp12 = $last_event_timestamp & 0xFFF;
