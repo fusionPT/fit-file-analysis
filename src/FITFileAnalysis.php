@@ -1909,6 +1909,9 @@ class FITFileAnalysis
         $missing_enhanced_speed_keys = [];
         $missing_enhanced_altitude_keys = [];
 
+        if (!is_array($this->data_mesgs['record']['timestamp'])) {
+            return;
+        }
         foreach ($this->data_mesgs['record']['timestamp'] as $timestamp) {
             if ($bCadence) {  // Assumes all missing cadence values are zeros
                 if (!isset($this->data_mesgs['record']['cadence'][$timestamp])) {
