@@ -38,6 +38,17 @@ if (!defined('FIT_UNIX_TS_DIFF')) {
 
 class FITFileAnalysis
 {
+    // Above any human output (track-sprint peaks are ~2,800 W). Power meters and
+    // head units occasionally write corrupt samples (21,844 / 43,690 W = 0x5554 /
+    // 0xAAAA bit patterns) in the middle of normal data; one 5h ride with 18 of
+    // them produced NP 2,279 W and TSS 22,468. See repairPowerSpikes().
+    const MAX_PLAUSIBLE_POWER_WATTS = 3000;
+    // Glitches below that ceiling: a short run of high samples with a cliff on both
+    // sides (e.g. 0 0 1793 2823 1762 1763 128). See repairPowerSamples().
+    const SPIKE_MIN_WATTS = 1000;
+    const SPIKE_MAX_SAMPLES = 3;
+    const SPIKE_RATIO = 3;
+
     public $data_mesgs = [];  // Used to store the data read from the file in associative arrays.
     private $dev_field_descriptions = [];
     private $options = null;                 // Options provided to __construct().
@@ -50,6 +61,7 @@ class FITFileAnalysis
     private $types = null;                   // Set by $endianness depending on architecture in Definition Message.
     private $garmin_timestamps = false;      // By default the constant FIT_UNIX_TS_DIFF will be added to timestamps.
     private $file_handler = null;            // Use php file stream with fopen, fread, fseek, ftell to read fit file instead of all file content in a variable with substr function
+    private $repaired_power = [];            // record timestamp => original power, for samples repairPowerSpikes() replaced
     // Enumerated data looked up by enumData().
     // Values from 'Profile.xls' contained within the FIT SDK.
     private $enum_data = [
@@ -1369,8 +1381,12 @@ class FITFileAnalysis
         // Process HR messages
         $this->processHrMessages();
 
+        $this->repairPowerSpikes();
+
         // Handle options.
         $this->fixData($this->options);
+        $this->repairPowerSummaries('lap');
+        $this->repairPowerSummaries('session');
         $this->setUnits($this->options);
         fclose($file_handler);
     }
@@ -1690,6 +1706,175 @@ class FITFileAnalysis
                             $this->data_mesgs['record'][$field_definition_number['field_name']] = [];
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /**
+     * Replace physically impossible record power samples (> MAX_PLAUSIBLE_POWER_WATTS)
+     * with the mean of the nearest valid samples either side, keeping every key so
+     * callers that index by timestamp or position are unaffected.
+     *
+     * The device's own lap/session summaries were computed from the same corrupt
+     * samples, so for each lap/session window that contained a spike: max_power is
+     * recomputed from the repaired samples, and avg_power / total_work are scaled by
+     * repaired-sum / original-sum (keeps whatever zero-averaging policy the device
+     * used). Runs before fixData(), when record keys are already Unix timestamps.
+     */
+    private function repairPowerSpikes()
+    {
+        if (!isset($this->data_mesgs['record']['power']) || !is_array($this->data_mesgs['record']['power'])) {
+            return;
+        }
+        ksort($this->data_mesgs['record']['power']);
+        $this->repaired_power = [];
+        $this->data_mesgs['record']['power'] = self::repairPowerSamples($this->data_mesgs['record']['power'], $this->repaired_power);
+    }
+
+    /**
+     * Repair an ordered power series (FIT records keyed by timestamp, or a plain
+     * list such as a Strava watts stream). A sample is corrupt when it is negative,
+     * above MAX_PLAUSIBLE_POWER_WATTS, or part of an isolated glitch (short run of
+     * high samples with a cliff on both sides). Each corrupt run becomes the mean of
+     * the nearest good samples either side (one side's value at the edges). Null
+     * gaps in API streams are left alone. Keys are preserved. $original receives
+     * key => original value for each repaired sample.
+     */
+    public static function repairPowerSamples(array $power, &$original = [])
+    {
+        $original = [];
+        $keys = array_keys($power);
+        $count = count($keys);
+        // Positions of numeric samples only; null gaps are skipped, never repaired.
+        $pos = [];
+        foreach ($keys as $key) {
+            if (is_numeric($power[$key])) {
+                $pos[] = $key;
+            }
+        }
+        $n = count($pos);
+        if (!$n) {
+            return $power;
+        }
+
+        // 1. Out of range: negative or above any human output.
+        $bad = [];
+        for ($i = 0; $i < $n; ++$i) {
+            $v = $power[$pos[$i]];
+            $bad[$i] = ($v < 0 || $v > self::MAX_PLAUSIBLE_POWER_WATTS);
+        }
+
+        // 2. Isolated glitch inside normal data: a run of at most SPIKE_MAX_SAMPLES
+        //    samples >= SPIKE_MIN_WATTS with a cliff on BOTH sides (every sample >=
+        //    SPIKE_RATIO x the nearest in-range sample before and after). Real sprints
+        //    ramp and hold for several seconds, so they never form such a run.
+        for ($i = 0; $i < $n; ++$i) {
+            if ($power[$pos[$i]] < self::SPIKE_MIN_WATTS) {
+                continue;
+            }
+            $runStart = $i;
+            while ($i + 1 < $n && $power[$pos[$i + 1]] >= self::SPIKE_MIN_WATTS) {
+                ++$i;
+            }
+            $runEnd = $i;
+            if ($runStart === 0 || $runEnd === $n - 1) {
+                continue;  // no sample on one side to compare with
+            }
+            $inRange = [];
+            for ($j = $runStart; $j <= $runEnd; ++$j) {
+                if (!$bad[$j]) {
+                    $inRange[] = $power[$pos[$j]];
+                }
+            }
+            if (!$inRange || count($inRange) > self::SPIKE_MAX_SAMPLES) {
+                continue;  // all out of range (step 1 has it) or too long to be a glitch
+            }
+            $side = max($power[$pos[$runStart - 1]], $power[$pos[$runEnd + 1]]);
+            if (min($inRange) >= self::SPIKE_RATIO * $side) {
+                for ($j = $runStart; $j <= $runEnd; ++$j) {
+                    $bad[$j] = true;
+                }
+            }
+        }
+
+        // 3. Fill each bad run with the mean of the nearest good samples either side.
+        for ($i = 0; $i < $n; ++$i) {
+            if (!$bad[$i]) {
+                continue;
+            }
+            $runStart = $i;
+            while ($i + 1 < $n && $bad[$i + 1]) {
+                ++$i;
+            }
+            $prev = $runStart > 0 ? $power[$pos[$runStart - 1]] : null;
+            $next = $i + 1 < $n ? $power[$pos[$i + 1]] : null;
+            if ($prev !== null && $next !== null) {
+                $fill = (int) round(($prev + $next) / 2);
+            } else {
+                $fill = (int) ($prev ?? $next ?? 0);
+            }
+            for ($j = $runStart; $j <= $i; ++$j) {
+                $original[$pos[$j]] = (float) $power[$pos[$j]];
+                $power[$pos[$j]] = $fill;
+            }
+        }
+        return $power;
+    }
+
+    /**
+     * Window of each lap/session: [start_time, start_time + total_elapsed_time].
+     * Runs after fixData(), which converts start_time to a Unix timestamp. (The
+     * `timestamp` field is not usable: some devices write the activity start into
+     * every lap's timestamp.)
+     */
+    private function repairPowerSummaries($mesg)
+    {
+        $original = $this->repaired_power;
+        if (!$original || !isset($this->data_mesgs[$mesg]['start_time'], $this->data_mesgs[$mesg]['total_elapsed_time'])) {
+            return;
+        }
+        $starts = $this->data_mesgs[$mesg]['start_time'];
+        $scalar = !is_array($starts);
+        $starts = $scalar ? [0 => $starts] : $starts;
+        $elapsed = $this->data_mesgs[$mesg]['total_elapsed_time'];
+        $power = $this->data_mesgs['record']['power'];
+
+        foreach ($starts as $idx => $start) {
+            $duration = $scalar ? $elapsed : ($elapsed[$idx] ?? null);
+            if (!is_numeric($start) || !is_numeric($duration)) {
+                continue;
+            }
+            $end = $start + $duration;
+            $originalSum = $repairedSum = 0.0;
+            $max = 0;
+            $touched = false;
+            foreach ($power as $ts => $value) {
+                if ($ts < $start || $ts > $end) {
+                    continue;
+                }
+                $repairedSum += $value;
+                $originalSum += $original[$ts] ?? $value;
+                $max = max($max, $value);
+                $touched = $touched || isset($original[$ts]);
+            }
+            if (!$touched) {
+                continue;
+            }
+            $ratio = $originalSum > 0 ? $repairedSum / $originalSum : 1;
+            foreach (['max_power' => null, 'avg_power' => $ratio, 'total_work' => $ratio] as $field => $scale) {
+                if (!isset($this->data_mesgs[$mesg][$field])) {
+                    continue;
+                }
+                $current = $scalar ? $this->data_mesgs[$mesg][$field] : ($this->data_mesgs[$mesg][$field][$idx] ?? null);
+                if (!is_numeric($current)) {
+                    continue;
+                }
+                $fixed = ($scale === null) ? min($current, $max) : (int) round($current * $scale);
+                if ($scalar) {
+                    $this->data_mesgs[$mesg][$field] = $fixed;
+                } else {
+                    $this->data_mesgs[$mesg][$field][$idx] = $fixed;
                 }
             }
         }
