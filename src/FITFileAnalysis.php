@@ -48,6 +48,15 @@ class FITFileAnalysis
     const SPIKE_MIN_WATTS = 1000;
     const SPIKE_MAX_SAMPLES = 3;
     const SPIKE_RATIO = 3;
+    // Longer junk bursts: mean power over N samples about twice what any human holds
+    // for N seconds (world bests ~1,300 W / 30 s, ~1,100 W / 1 min). Only repaired
+    // when the burst is short and surrounded by far lower power. Deliberately loose:
+    // meters that over-read real efforts (e-bike, bad calibration) reach 1,500-2,200 W
+    // for a minute while HR climbs to 160+, and their true values are unknown, so no
+    // 5-min limit either.
+    const BURST_LIMIT_WATTS = [30 => 2500, 60 => 2000];
+    const BURST_MAX_SAMPLES = 600;
+    const BURST_CONTEXT_SAMPLES = 60;
 
     public $data_mesgs = [];  // Used to store the data read from the file in associative arrays.
     private $dev_field_descriptions = [];
@@ -1722,6 +1731,15 @@ class FITFileAnalysis
      * repaired-sum / original-sum (keeps whatever zero-averaging policy the device
      * used). Runs before fixData(), when record keys are already Unix timestamps.
      */
+    /**
+     * Record timestamp => original power for every sample repairPowerSpikes()
+     * replaced while parsing this file (empty when the power data was clean).
+     */
+    public function getRepairedPowerSamples()
+    {
+        return $this->repaired_power;
+    }
+
     private function repairPowerSpikes()
     {
         if (!isset($this->data_mesgs['record']['power']) || !is_array($this->data_mesgs['record']['power'])) {
@@ -1735,11 +1753,14 @@ class FITFileAnalysis
     /**
      * Repair an ordered power series (FIT records keyed by timestamp, or a plain
      * list such as a Strava watts stream). A sample is corrupt when it is negative,
-     * above MAX_PLAUSIBLE_POWER_WATTS, or part of an isolated glitch (short run of
-     * high samples with a cliff on both sides). Each corrupt run becomes the mean of
-     * the nearest good samples either side (one side's value at the edges). Null
-     * gaps in API streams are left alone. Keys are preserved. $original receives
-     * key => original value for each repaired sample.
+     * above MAX_PLAUSIBLE_POWER_WATTS, part of an isolated glitch (short run of high
+     * samples with a cliff on both sides), or part of a junk burst (short stretch
+     * averaging more than any human can hold, far above the power around it).
+     * Glitches and out-of-range samples become the mean of the nearest good samples
+     * either side; bursts become the surrounding power level. Sustained high power
+     * with no low surroundings is never changed. Null gaps in API streams are left
+     * alone. Keys are preserved. $original receives key => original value for each
+     * repaired sample.
      */
     public static function repairPowerSamples(array $power, &$original = [])
     {
@@ -1798,7 +1819,18 @@ class FITFileAnalysis
             }
         }
 
-        // 3. Fill each bad run with the mean of the nearest good samples either side.
+        // 3. Junk burst: a stretch whose mean over 30 s / 1 min / 5 min is above
+        //    BURST_LIMIT_WATTS, at most BURST_MAX_SAMPLES long, and >= SPIKE_RATIO x
+        //    the typical (median) power of the BURST_CONTEXT_SAMPLES before and after
+        //    it. Filled with the mean power of those surroundings instead of edge
+        //    neighbours, which are often part of the junk.
+        $burstFill = self::findPowerBursts($power, $pos, $bad);
+        foreach ($burstFill as $i => $fill) {
+            $bad[$i] = true;
+        }
+
+        // 4. Fill each bad run: burst samples with their surrounding level, the rest
+        //    with the mean of the nearest good samples either side.
         for ($i = 0; $i < $n; ++$i) {
             if (!$bad[$i]) {
                 continue;
@@ -1816,10 +1848,117 @@ class FITFileAnalysis
             }
             for ($j = $runStart; $j <= $i; ++$j) {
                 $original[$pos[$j]] = (float) $power[$pos[$j]];
-                $power[$pos[$j]] = $fill;
+                $power[$pos[$j]] = $burstFill[$j] ?? $fill;
             }
         }
         return $power;
+    }
+
+    /**
+     * Step 3 of repairPowerSamples(): index (into $pos) => fill value for every
+     * sample inside a junk burst. Rolling means use sample counts, so smart-recording
+     * files (one sample every few seconds) are judged over longer real time — more
+     * lenient, never stricter.
+     */
+    private static function findPowerBursts(array $power, array $pos, array $bad)
+    {
+        $n = count($pos);
+        // Out-of-range samples count at the ceiling, so a burst of them still weighs in.
+        $v = [];
+        for ($i = 0; $i < $n; ++$i) {
+            $v[$i] = $bad[$i] ? min(max($power[$pos[$i]], 0), self::MAX_PLAUSIBLE_POWER_WATTS) : $power[$pos[$i]];
+        }
+
+        // Mark every sample covered by a window over its limit (difference array).
+        $cover = array_fill(0, $n + 1, 0);
+        foreach (self::BURST_LIMIT_WATTS as $window => $limit) {
+            if ($n < $window) {
+                continue;
+            }
+            $sum = 0.0;
+            for ($i = 0; $i < $n; ++$i) {
+                $sum += $v[$i];
+                if ($i >= $window) {
+                    $sum -= $v[$i - $window];
+                }
+                if ($i >= $window - 1 && $sum > $limit * $window) {
+                    $cover[$i - $window + 1]++;
+                    $cover[$i + 1]--;
+                }
+            }
+        }
+
+        $flagged = [];
+        $depth = 0;
+        for ($i = 0; $i < $n; ++$i) {
+            $depth += $cover[$i];
+            $flagged[$i] = $depth > 0;
+        }
+
+        $median = function (array $xs) {
+            sort($xs);
+            $c = count($xs);
+            return $c % 2 ? $xs[intdiv($c, 2)] : ($xs[$c / 2 - 1] + $xs[$c / 2]) / 2;
+        };
+
+        $fill = [];
+        for ($i = 0; $i < $n; ++$i) {
+            if (!$flagged[$i]) {
+                continue;
+            }
+            $a = $i;
+            while ($i + 1 < $n && $flagged[$i + 1]) {
+                ++$i;
+            }
+            $b = $i;
+            // A window over the limit also covers the real samples around the junk:
+            // trim those ends back to where the high power starts and stops.
+            while ($a <= $b && $v[$a] < self::SPIKE_MIN_WATTS) {
+                ++$a;
+            }
+            while ($b >= $a && $v[$b] < self::SPIKE_MIN_WATTS) {
+                --$b;
+            }
+            if ($a > $b || $b - $a + 1 > self::BURST_MAX_SAMPLES) {
+                continue;  // nothing high left, or too long to call a burst
+            }
+
+            $before = [];
+            for ($k = $a - 1; $k >= 0 && count($before) < self::BURST_CONTEXT_SAMPLES; --$k) {
+                if (!$flagged[$k] && !$bad[$k]) {
+                    $before[] = $v[$k];
+                }
+            }
+            $after = [];
+            for ($k = $b + 1; $k < $n && count($after) < self::BURST_CONTEXT_SAMPLES; ++$k) {
+                if (!$flagged[$k] && !$bad[$k]) {
+                    $after[] = $v[$k];
+                }
+            }
+            if (!$before && !$after) {
+                continue;  // the whole series is high: no surrounding level to trust
+            }
+            // Median decides whether the surroundings are low (robust to a stray
+            // sprint); the mean is the fill, so coasting doesn't zero out work.
+            $typical = [];
+            $context = array_merge($before, $after);
+            if ($before) {
+                $typical[] = $median($before);
+            }
+            if ($after) {
+                $typical[] = $median($after);
+            }
+
+            $burstMean = array_sum(array_slice($v, $a, $b - $a + 1)) / ($b - $a + 1);
+            if ($burstMean < self::SPIKE_RATIO * max($typical)) {
+                continue;  // surroundings are high too: sustained, not a burst
+            }
+            $level = (int) round(array_sum($context) / count($context));
+            for ($k = $a; $k <= $b; ++$k) {
+                $fill[$k] = $level;
+            }
+        }
+        return $fill;
     }
 
     /**
