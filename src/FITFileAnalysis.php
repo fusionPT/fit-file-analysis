@@ -1366,7 +1366,11 @@ class FITFileAnalysis
             ]);
             $this->file_handler = fopen($file_path_or_data, 'rb',false, $context);
             $file_handler = $this->file_handler;
-            register_shutdown_function(function () use ($file_handler) {
+            // static: a closure declared in a method binds $this, and the shutdown
+            // registry holds it for the life of the process — that kept every parsed
+            // file (~8 MB each) in memory, so long-lived workers and backfills grew
+            // until FitFileActivity::canProcess() refused further files.
+            register_shutdown_function(static function () use ($file_handler) {
                 is_resource($file_handler) && fclose($file_handler);
             });
 
