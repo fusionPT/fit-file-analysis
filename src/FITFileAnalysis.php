@@ -1626,8 +1626,8 @@ class FITFileAnalysis
 
                         // Handle Developer Data
                         if ($global_mesg_num === 206) {
-                            $developer_data_index = $tmp_record_array['developer_data_index'];
-                            $field_definition_number = $tmp_record_array['field_definition_number'];
+                            $developer_data_index = $tmp_record_array['developer_data_index'] ?? null;
+                            $field_definition_number = $tmp_record_array['field_definition_number'] ?? null;
                             unset($tmp_record_array['developer_data_index']);
                             unset($tmp_record_array['field_definition_number']);
                             if (isset($tmp_record_array['field_name'])) {  // Get rid of special/invalid characters after the null terminated string
@@ -1636,7 +1636,9 @@ class FITFileAnalysis
                             if (isset($tmp_record_array['units'])) {
                                 $tmp_record_array['units'] = strtolower(implode('', explode("\0", $tmp_record_array['units'])));
                             }
-                            $this->dev_field_descriptions[$developer_data_index][$field_definition_number] = $tmp_record_array;
+                            if ($developer_data_index !== null && $field_definition_number !== null) {
+                                $this->dev_field_descriptions[$developer_data_index][$field_definition_number] = $tmp_record_array;
+                            }
                             unset($tmp_record_array);
                         }
                         foreach ($this->defn_mesgs[$local_mesg_type]['dev_field_definitions'] as $field_defn) {
@@ -1645,20 +1647,25 @@ class FITFileAnalysis
                                 $this->data_mesgs['developer_data'] = [];
                             }
 
-                            if (!isset($this->dev_field_descriptions[$field_defn['developer_data_index']])) {
+                            // The field's bytes are always consumed, described or not:
+                            // the record loop reads on from ftell(), so skipping them
+                            // would read the rest of the file out of step.
+                            $raw_binary_data = fread($this->file_handler, $field_defn['size']);
+                            $this->file_pointer += $field_defn['size'];
+
+                            // A developer field is only readable with the field_description
+                            // that names it and gives its base type. Some apps (Connect IQ
+                            // data fields) write data for fields they never describe.
+                            $description = $this->dev_field_descriptions[$field_defn['developer_data_index']][$field_defn['field_definition_number']] ?? null;
+                            $field_name = $description['field_name'] ?? null;
+                            $format = $this->types[$description['fit_base_type_id'] ?? null]['format'] ?? null;
+                            if ($field_name === null || $field_name === '' || $format === null) {
                                 continue;
                             }
-                            $developer_data_index = $field_defn['developer_data_index'];
-                            $field_definition_number = $field_defn['field_definition_number'];
-                            $field_name = $this->dev_field_descriptions[$developer_data_index][$field_definition_number]['field_name'];
-                            $this->data_mesgs['developer_data'][$field_name]['units'] = $this->dev_field_descriptions[$developer_data_index][$field_definition_number]['units'] ?? null;
 
-                            // Data
-                            $format = $this->types[$this->dev_field_descriptions[$developer_data_index][$field_definition_number]['fit_base_type_id']]['format'];
-                            $raw_binary_data = fread($this->file_handler, $field_defn['size']);
-                            $this->data_mesgs['developer_data'][$field_name]['data'][] = unpack($format, $raw_binary_data)['tmp'];
-
-                            $this->file_pointer += $field_defn['size'];
+                            $this->data_mesgs['developer_data'][$field_name]['units'] = $description['units'] ?? null;
+                            $unpacked = strlen($raw_binary_data) > 0 ? @unpack($format, $raw_binary_data) : false;
+                            $this->data_mesgs['developer_data'][$field_name]['data'][] = $unpacked['tmp'] ?? null;
                         }
 
                         // Process the temporary array and load values into the public data messages array
