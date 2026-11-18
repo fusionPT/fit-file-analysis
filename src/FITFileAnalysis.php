@@ -1440,10 +1440,87 @@ class FITFileAnalysis
             throw new \Exception('FITFileAnalysis->readHeader(): not a valid FIT file!');
         }
 
+        $this->file_header['offset'] = 0;
+        $this->seekCompleteCopy($raw_header_size . $raw_file_header);
+
         //if (strlen($this->file_contents) - $header_size - 2 !== $this->file_header['data_size']) {
         // Overwrite the data_size. Seems to be incorrect if there are buffered messages e.g. HR records.
         //$this->file_header['data_size'] = $this->file_header['crc'] - $header_size + 2;
         //}
+    }
+
+    /**
+     * A download that is retried into the same, un-rewound file stores every
+     * interrupted attempt in front of the one that finished:
+     *
+     *   [first N bytes of the file][first M bytes of the file]...[whole file]
+     *
+     * Each piece starts with the same header, so the header at offset 0 is valid
+     * but its data_size describes only the last piece. Reading on from offset 0
+     * runs off the end of the first piece mid-record and parses the next piece's
+     * header as a record (byte 0x0E = data message, local type 14), and every
+     * record after that is garbage.
+     *
+     * When the file is longer than its header says, and its last
+     * header_size + data_size + 2 bytes start with the same header and end with a
+     * matching file CRC, that tail is the complete file: read it instead.
+     * A file whose length matches its header is not touched (no extra reads).
+     *
+     * @param string $raw_header The header bytes read at offset 0.
+     */
+    private function seekCompleteCopy($raw_header)
+    {
+        $header_size = $this->file_header['header_size'];
+        $file_length = $header_size + $this->file_header['data_size'] + 2;  // header + records + CRC
+        $stat = fstat($this->file_handler);
+        $size = $stat['size'] ?? 0;
+        if ($size <= $file_length) {
+            return;
+        }
+
+        $offset = $size - $file_length;
+        fseek($this->file_handler, $offset);
+        $copy = fread($this->file_handler, $file_length);
+        fseek($this->file_handler, $header_size);
+
+        if (strlen($copy) !== $file_length || strncmp($copy, $raw_header, $header_size) !== 0) {
+            return;
+        }
+        $stored_crc = unpack('v1crc', substr($copy, -2))['crc'];
+        if (self::fitCrc(substr($copy, 0, -2)) !== $stored_crc) {
+            return;
+        }
+
+        error_log(sprintf(
+            'FITFileAnalysis: the first %d bytes are interrupted copies of this file (header and CRC match the last %d bytes); reading the complete copy.',
+            $offset,
+            $file_length
+        ));
+        $this->file_header['offset'] = $offset;
+        fseek($this->file_handler, $offset + $header_size);
+        $this->file_pointer = $offset + $header_size;
+    }
+
+    /**
+     * FIT CRC-16 (FIT protocol, "CRC").
+     *
+     * @param string $data
+     * @return int
+     */
+    private static function fitCrc($data)
+    {
+        static $table = [0x0000, 0xCC01, 0xD801, 0x1400, 0xF001, 0x3C00, 0x2800, 0xE401,
+            0xA001, 0x6C00, 0x7800, 0xB401, 0x5000, 0x9C01, 0x8801, 0x4400];
+        $crc = 0;
+        $length = strlen($data);
+        for ($i = 0; $i < $length; ++$i) {
+            $byte = ord($data[$i]);
+            $tmp = $table[$crc & 0xF];
+            $crc = (($crc >> 4) & 0x0FFF) ^ $tmp ^ $table[$byte & 0xF];
+            $tmp = $table[$crc & 0xF];
+            $crc = (($crc >> 4) & 0x0FFF) ^ $tmp ^ $table[($byte >> 4) & 0xF];
+        }
+        return $crc;
     }
 
     /**
@@ -1458,9 +1535,20 @@ class FITFileAnalysis
         $previousTS = 0;
 
 
-        while ($this->file_header['header_size'] + $this->file_header['data_size'] > ftell($this->file_handler)) { //ftell($this->file_handler)
+        $data_end = $this->file_header['offset'] + $this->file_header['header_size'] + $this->file_header['data_size'];
+        while ($data_end > ftell($this->file_handler)) {
+            $record_offset = ftell($this->file_handler);
             //$record_header_byte = ord(fread($this->file_handler, 1));
             $raw_record_header_byte = fread($this->file_handler, 1);
+            if ($raw_record_header_byte === '' || $raw_record_header_byte === false) {
+                // The file ends before the data_size its header gives (truncated).
+                error_log(sprintf(
+                    'FITFileAnalysis: file ends at byte %d, before the %d its header gives; keeping the records read so far.',
+                    $record_offset,
+                    $data_end
+                ));
+                break;
+            }
             $record_header_byte = ord($raw_record_header_byte);
             $this->file_pointer++;
 
@@ -1561,6 +1649,19 @@ class FITFileAnalysis
                     break;
 
                 case DATA_MESSAGE:
+                    // A data message needs an earlier definition for its local type
+                    // to know its size. Without one the reader is out of step with
+                    // the file (truncated or corrupt data), and nothing after this
+                    // byte can be located: stop and keep what was read.
+                    if (!isset($this->defn_mesgs[$local_mesg_type])) {
+                        error_log(sprintf(
+                            'FITFileAnalysis: data message at byte %d uses local message type %d, which has no definition; file is corrupt or truncated from here, keeping the records read so far.',
+                            $record_offset,
+                            $local_mesg_type
+                        ));
+                        break 2;
+                    }
+
                     // Check that we have information on the Data Message.
                     $global_mesg_num = $this->defn_mesgs[$local_mesg_type]['global_mesg_num'];
 
@@ -1570,6 +1671,9 @@ class FITFileAnalysis
                         $tmp_value = null;  // Placeholder for value for checking before inserting into the tmp_record_array
 
                         foreach ($this->defn_mesgs[$local_mesg_type]['field_defns'] as $field_defn) {
+                            if ($field_defn['size'] === 0) {
+                                continue;  // no bytes to read (and fread() of 0 throws on PHP 8)
+                            }
                             // Check that we have information on the Field Definition and a valid base type exists.
                             if (isset($this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']]) && isset($this->types[$field_defn['base_type']])) {
                                 $field_defns = $this->data_mesg_info[$global_mesg_num]['field_defns'][$field_defn['field_definition_number']];
@@ -1581,6 +1685,15 @@ class FITFileAnalysis
 
                                 $raw_binary_data = fread($this->file_handler, $size);
 
+                                if (strlen($raw_binary_data) < $size) {
+                                    // The file ends inside this record (truncated).
+                                    error_log(sprintf(
+                                        'FITFileAnalysis: file ends inside the record at byte %d, before the %d its header gives; keeping the records read so far.',
+                                        $record_offset,
+                                        $data_end
+                                    ));
+                                    break 3;
+                                }
                                 if (strlen($raw_binary_data) < 4 && strpos($format, 'V') !== false) {
                                     continue;
                                 }
@@ -1650,7 +1763,8 @@ class FITFileAnalysis
                             // The field's bytes are always consumed, described or not:
                             // the record loop reads on from ftell(), so skipping them
                             // would read the rest of the file out of step.
-                            $raw_binary_data = fread($this->file_handler, $field_defn['size']);
+                            // fread() of 0 bytes throws a ValueError on PHP 8.
+                            $raw_binary_data = $field_defn['size'] > 0 ? fread($this->file_handler, $field_defn['size']) : '';
                             $this->file_pointer += $field_defn['size'];
 
                             // A developer field is only readable with the field_description
